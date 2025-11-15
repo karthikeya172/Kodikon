@@ -1,0 +1,119 @@
+# Mesh Network Protocol Configuration
+# Settings for peer discovery, communication, and network topology
+
+# ============================================================================
+# MESH DISCOVERY SETTINGS
+# ============================================================================
+discovery:
+  protocol: "udp"
+  broadcast_interval_seconds: 5
+  broadcast_timeout_seconds: 30
+  multicast_enabled: false
+  multicast_group: "224.0.0.1"
+  multicast_port: 5353
+
+# ============================================================================
+# PEER MANAGEMENT
+# ============================================================================
+peers:
+  max_peers: 10
+  connection_timeout_ms: 5000
+  handshake_timeout_ms: 2000
+  heartbeat_interval_ms: 5000
+  heartbeat_timeout_ms: 30000
+  stale_peer_cleanup_interval_seconds: 60
+  max_reconnect_attempts: 5
+  reconnect_backoff_ms: 1000  # exponential backoff
+
+# ============================================================================
+# MESH PORTS & COMMUNICATION
+# ============================================================================
+ports:
+  discovery_port: 9999        # UDP broadcast/discovery
+  data_port: 9998             # TCP data transfer
+  control_port: 9997          # TCP control commands
+  metrics_port: 9996          # TCP metrics/status
+  http_api_port: 8888         # HTTP REST API
+
+# ============================================================================
+# NETWORK SETTINGS
+# ============================================================================
+network:
+  interface: "0.0.0.0"        # Bind to all interfaces
+  ipv4_enabled: true
+  ipv6_enabled: false
+  allow_loopback: true
+  max_packet_size_bytes: 65536
+  tcp_buffer_size_bytes: 131072
+  socket_timeout_ms: 10000
+  enable_keepalive: true
+
+# ============================================================================
+# MESSAGE ROUTING & TOPOLOGY
+# ============================================================================
+routing:
+  protocol: "gossip"          # "gossip", "flooding", "dht"
+  ttl_hops: 5                 # Time-to-live for forwarded messages
+  duplicate_window_ms: 5000   # Dedup window for rebroadcasts
+  max_retries: 3
+  backoff_multiplier: 2.0
+  message_queue_size: 1000
+  priority_queue_enabled: true
+
+# ============================================================================
+# MESH SECURITY
+# ============================================================================
+security:
+  encryption_enabled: true
+  encryption_algorithm: "AES-256-GCM"
+  tls_enabled: false
+  tls_verify_peer: false
+  auth_required: false
+  auth_timeout_ms: 5000
+  rate_limiting_enabled: true
+  rate_limit_msgs_per_sec: 1000
+
+# ============================================================================
+# METRICS & MONITORING
+# ============================================================================
+metrics:
+  enabled: true
+  collection_interval_ms: 1000
+  history_retention_seconds: 3600
+  export_format: "prometheus"  # "prometheus", "json"
+  track_bandwidth: true
+  track_latency: true
+  track_peer_health: true
+
+# ============================================================================
+# LOGGING & DEBUGGING
+# ============================================================================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  protocol_trace: false
+  packet_dump: false
+  peer_events: true
+  message_events: true
+  performance_stats: true
+
+# ============================================================================
+# CLUSTER CONFIGURATION (Optional)
+# ============================================================================
+cluster:
+  mode: "autonomous"          # "autonomous", "orchestrated", "hierarchical"
+  leader_election: false
+  node_id_type: "uuid"        # "uuid", "mac_address", "hostname"
+  sync_state: false
+  gossip_peers_count: 3       # fanout for gossip protocol
+
+# ============================================================================
+# PERFORMANCE TUNING
+# ============================================================================
+performance:
+  thread_pool_size: 4
+  message_batch_size: 50
+  batch_timeout_ms: 100
+  enable_compression: true
+  compression_level: 6        # 1-9, higher = more compression
+  enable_pooling: true
+  connection_pool_size: 20

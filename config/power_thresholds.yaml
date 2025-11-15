@@ -1,0 +1,200 @@
+# Power Management Thresholds & Modes Configuration
+# Dynamic power optimization based on device capabilities and activity
+
+# ============================================================================
+# POWER MODES DEFINITION
+# ============================================================================
+modes:
+  eco:
+    description: "Maximum power savings, minimum performance"
+    min_fps: 5
+    max_fps: 15
+    cpu_target_percent: 30
+    quality_scale: 0.6       # 60% of full quality
+    inference_skip_frames: 3
+    motion_detection: false
+    mesh_broadcast_interval: 10
+    
+  balanced:
+    description: "Default mode, balanced power and performance"
+    min_fps: 10
+    max_fps: 30
+    cpu_target_percent: 60
+    quality_scale: 0.85      # 85% of full quality
+    inference_skip_frames: 1
+    motion_detection: true
+    mesh_broadcast_interval: 5
+    
+  performance:
+    description: "Maximum performance, higher power consumption"
+    min_fps: 25
+    max_fps: 60
+    cpu_target_percent: 90
+    quality_scale: 1.0       # Full quality
+    inference_skip_frames: 0
+    motion_detection: true
+    mesh_broadcast_interval: 3
+
+# ============================================================================
+# BATTERY THRESHOLDS
+# ============================================================================
+battery:
+  critical_level_percent: 5
+  low_level_percent: 15       # Triggers eco mode
+  normal_level_percent: 40
+  full_level_percent: 100
+  charge_detect_threshold_percent: 20  # Consider "plugged in" above this
+  battery_check_interval_ms: 2000
+
+# ============================================================================
+# THERMAL MANAGEMENT
+# ============================================================================
+thermal:
+  enabled: true
+  warning_temp_celsius: 75
+  critical_temp_celsius: 85
+  throttle_multiplier: 0.8   # Reduce to 80% performance
+  cooldown_check_interval_ms: 1000
+  max_iterations_before_throttle: 10
+  recovery_temp_celsius: 65
+
+# ============================================================================
+# ACTIVITY & MOTION THRESHOLDS
+# ============================================================================
+activity:
+  motion_detection_enabled: true
+  motion_threshold: 0.3       # 0.0-1.0, lower = more sensitive
+  motion_cooldown_seconds: 2
+  
+  # Frame diff statistics
+  frame_diff_quantile: 95     # Use 95th percentile
+  noise_floor: 10             # Pixel intensity variance threshold
+  
+  # Scene complexity
+  complexity_threshold: 0.5   # 0.0-1.0
+  
+  # Idle detection
+  idle_timeout_seconds: 30    # Enter reduced mode after idle
+  idle_mode: "eco"
+  wake_on_motion: true
+
+# ============================================================================
+# CPU & MEMORY THRESHOLDS
+# ============================================================================
+resource:
+  cpu_warning_percent: 80
+  cpu_critical_percent: 95
+  memory_warning_percent: 75
+  memory_critical_percent: 90
+  
+  # Throttling triggers
+  auto_throttle_enabled: true
+  throttle_on_cpu_above_percent: 85
+  throttle_on_memory_above_percent: 80
+  throttle_duration_seconds: 5
+  
+  # Thread management
+  max_worker_threads: 4
+  min_worker_threads: 1
+
+# ============================================================================
+# MODEL INFERENCE OPTIMIZATION
+# ============================================================================
+models:
+  yolo:
+    enabled: true
+    optimize_for_latency: false
+    batch_size: 1
+    quantization: "none"      # "none", "int8", "fp16"
+    dynamic_shapes: false
+    skip_frames_on_high_load: 2
+    
+  reid:
+    enabled: true
+    optimize_for_latency: true
+    batch_size: 16
+    quantization: "fp16"      # Faster on some devices
+    dynamic_shapes: true
+    skip_frames_on_high_load: 3
+
+# ============================================================================
+# FPS & FRAME DROPPING POLICY
+# ============================================================================
+frame_management:
+  adaptive_fps: true
+  target_utilization_percent: 70
+  fps_adjustment_step: 2      # Adjust by 2 FPS increments
+  adjustment_interval_ms: 1000
+  min_fps: 5
+  max_fps: 60
+  
+  # Graceful degradation
+  drop_non_critical_frames: true
+  drop_reid_frames_first: true
+  drop_yolo_frames_second: true
+  retain_preview_minimum_fps: 5
+
+# ============================================================================
+# POWER EVENT TRIGGERS
+# ============================================================================
+events:
+  on_battery_low:
+    action: "switch_mode"
+    target_mode: "eco"
+    notify_apps: true
+    
+  on_battery_critical:
+    action: "emergency_shutdown"
+    grace_period_seconds: 30
+    save_state: true
+    
+  on_thermal_warning:
+    action: "throttle"
+    reduce_to_percent: 80
+    
+  on_thermal_critical:
+    action: "shutdown"
+    grace_period_seconds: 10
+    
+  on_idle:
+    action: "reduce_mode"
+    target_mode: "eco"
+    
+  on_motion_detected:
+    action: "resume_normal"
+    target_mode: "balanced"
+
+# ============================================================================
+# MESH NETWORK POWER OPTIMIZATION
+# ============================================================================
+mesh_power:
+  reduce_broadcasts_on_battery: true
+  broadcast_interval_eco_seconds: 15
+  broadcast_interval_balanced_seconds: 5
+  broadcast_interval_performance_seconds: 2
+  
+  disable_mesh_on_critical_battery: true
+  disable_mesh_battery_threshold_percent: 5
+  
+  peer_sync_interval_seconds: 30
+
+# ============================================================================
+# DISPLAY & UI POWER
+# ============================================================================
+display:
+  backlight_on_battery: 50     # Percent brightness
+  backlight_plugged_in: 100
+  screen_timeout_seconds: 60
+  screen_timeout_on_battery_seconds: 30
+  accelerometer_enabled: true
+
+# ============================================================================
+# LOGGING & DIAGNOSTICS
+# ============================================================================
+diagnostics:
+  log_power_events: true
+  log_frequency_changes: true
+  log_throttle_events: true
+  performance_profiling: false
+  save_power_logs: true
+  retention_days: 7

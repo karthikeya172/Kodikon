@@ -1,0 +1,108 @@
+# Default System Configuration
+# Comprehensive settings for Kodikon vision & mesh system
+
+# ============================================================================
+# CAMERA SETTINGS
+# ============================================================================
+camera:
+  fps: 30
+  width: 1280
+  height: 720
+  format: "bgr8"
+  buffer_size: 30
+  timeout_ms: 5000
+
+# ============================================================================
+# VISION PIPELINE SETTINGS
+# ============================================================================
+
+# YOLO Object Detection
+yolo:
+  model: "yolov8n"  # nano, small, medium, large, xlarge
+  model_path: "./models/yolo/"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+  device: "cpu"  # "cpu", "cuda", "mps"
+  inference_timeout_ms: 1000
+
+# ReID (Re-Identification)
+reid:
+  model: "osnet_x1_0"
+  model_path: "./models/reid/"
+  embedding_dim: 512
+  similarity_threshold: 0.6
+  batch_size: 32
+  inference_timeout_ms: 500
+
+# Baggage Linking
+baggage_linking:
+  enabled: true
+  spatial_threshold: 0.7
+  temporal_threshold: 5.0
+  max_tracked_objects: 100
+
+# ============================================================================
+# POWER MANAGEMENT SETTINGS
+# ============================================================================
+power:
+  mode: "balanced"  # "eco", "balanced", "performance"
+  min_fps: 10
+  max_fps: 30
+  motion_threshold: 0.3
+  battery_reserve: 15  # percent
+  check_interval_ms: 500
+  adaptive_quality: true
+
+# ============================================================================
+# MESH NETWORK SETTINGS
+# ============================================================================
+mesh:
+  broadcast_interval: 5  # seconds
+  heartbeat_timeout: 30  # seconds
+  max_peers: 10
+  udp_port: 9999
+  data_port: 9998
+  max_packet_size: 65536
+  connection_timeout_ms: 5000
+
+# ============================================================================
+# STREAMING SETTINGS
+# ============================================================================
+streaming:
+  enabled: true
+  protocol: "websocket"  # "websocket", "rtsp", "http"
+  host: "0.0.0.0"
+  port: 8000
+  buffer_size: 30
+  frame_skip: 0  # 0 = no skip, send every frame
+  quality: 80  # jpeg quality
+
+# ============================================================================
+# LOGGING SETTINGS
+# ============================================================================
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  format: "json"  # "json", "text"
+  output_dir: "./logs"
+  max_file_size_mb: 100
+  backup_count: 5
+  console_output: true
+
+# ============================================================================
+# DATABASE/STORAGE SETTINGS
+# ============================================================================
+storage:
+  type: "local"  # "local", "redis", "mongodb"
+  cache_size_mb: 256
+  embeddings_cache: true
+  persist_detections: false
+
+# ============================================================================
+# SYSTEM SETTINGS
+# ============================================================================
+system:
+  timezone: "UTC"
+  auto_restart: true
+  health_check_interval_ms: 1000
+  max_threads: 4
+  memory_limit_mb: 2048

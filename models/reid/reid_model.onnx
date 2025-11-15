@@ -1,0 +1,17 @@
+PLACEHOLDER: ReID Model (ONNX format)
+This is a placeholder file. Replace with actual reid_model.onnx model.
+Model: Light ReID Model
+Format: ONNX (.onnx)
+Size: ~8-12 MB (actual model, not this placeholder)
+Input: 256x128 RGB images, normalized to [0, 1]
+Output: 512-dimensional feature vector
+
+To use actual ReID model:
+1. Download from official sources or use pre-trained models
+2. Convert to ONNX format if necessary
+3. Place in this directory
+
+Example sources:
+- Strong ReID Baseline: https://github.com/michuanhaohao/reid-strong-baseline
+- TransReID: https://github.com/damo-cv/TransReID
+- Custom trained models from your own dataset

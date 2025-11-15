@@ -1,0 +1,28 @@
+{
+  "streams": [
+    {
+      "url": "http://192.168.1.100:8080/video",
+      "name": "Entrance Hall",
+      "max_retries": 3,
+      "retry_delay": 2,
+      "enable_yolo": true,
+      "confidence_threshold": 0.5
+    },
+    {
+      "url": "http://192.168.1.101:8080/video",
+      "name": "Baggage Claim",
+      "max_retries": 3,
+      "retry_delay": 2,
+      "enable_yolo": true,
+      "confidence_threshold": 0.5
+    },
+    {
+      "url": "http://192.168.1.102:8080/video",
+      "name": "Departure Gate",
+      "max_retries": 3,
+      "retry_delay": 2,
+      "enable_yolo": false,
+      "confidence_threshold": 0.5
+    }
+  ]
+}

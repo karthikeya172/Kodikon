@@ -3,7 +3,7 @@
 
 Write-Host ""
 Write-Host "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
-Write-Host "║  Kodikon Project - Python Environment Setup               ║" -ForegroundColor Cyan
+Write-Host "║  Kodikon Project - Python Environment Setup                ║" -ForegroundColor Cyan
 Write-Host "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
 Write-Host ""
 
