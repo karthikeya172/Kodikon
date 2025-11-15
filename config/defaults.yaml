@@ -1,0 +1,35 @@
+# Default System Configuration
+
+# Camera settings
+camera:
+  fps: 30
+  width: 1280
+  height: 720
+  format: "bgr8"
+
+# YOLO settings
+yolo:
+  model: "yolov8n"
+  confidence_threshold: 0.5
+  iou_threshold: 0.45
+
+# ReID settings
+reid:
+  model: "osnet_x1_0"
+  embedding_dim: 512
+  similarity_threshold: 0.6
+
+# Power management
+power:
+  mode: "balanced"  # "eco", "balanced", "performance"
+  min_fps: 10
+  max_fps: 30
+  motion_threshold: 0.3
+  battery_reserve: 15
+
+# Mesh network
+mesh:
+  broadcast_interval: 5
+  heartbeat_timeout: 30
+  max_peers: 10
+  udp_port: 9999
