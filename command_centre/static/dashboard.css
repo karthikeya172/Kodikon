@@ -1,0 +1,366 @@
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #0f0f1e;
+    color: #e0e0e0;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1920px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 20px 0;
+    border-bottom: 2px solid #1e1e3f;
+    margin-bottom: 30px;
+}
+
+h1 {
+    font-size: 2rem;
+    color: #00d4ff;
+}
+
+h2 {
+    font-size: 1.3rem;
+    margin-bottom: 15px;
+    color: #00d4ff;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-indicator .dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ff4444;
+    animation: pulse 2s infinite;
+}
+
+.status-indicator.connected .dot {
+    background: #44ff44;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+}
+
+.camera-feeds-panel-full {
+    background: #1a1a2e;
+    border: 1px solid #2a2a4e;
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+}
+
+.camera-feeds-panel-full h2 {
+    margin-bottom: 20px;
+}
+
+.dashboard-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(500px, 1fr));
+    gap: 20px;
+}
+
+.panel {
+    background: #1a1a2e;
+    border: 1px solid #2a2a4e;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+}
+
+.node-list, .camera-grid, .logs-container, .search-results {
+    max-height: 400px;
+    overflow-y: auto;
+}
+
+.node-item {
+    background: #252540;
+    padding: 15px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+    border-left: 4px solid #00d4ff;
+}
+
+.node-header {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.node-id {
+    font-weight: bold;
+    color: #00d4ff;
+}
+
+.node-mode {
+    background: #3a3a5a;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.85rem;
+}
+
+.node-stats {
+    display: flex;
+    gap: 15px;
+    font-size: 0.9rem;
+    color: #b0b0b0;
+}
+
+.camera-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    padding: 10px;
+}
+
+@media (max-width: 1400px) {
+    .camera-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 900px) {
+    .camera-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+.camera-feed {
+    background: #252540;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.camera-feed:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 12px rgba(0, 212, 255, 0.3);
+}
+
+.feed-header {
+    background: linear-gradient(135deg, #3a3a5a 0%, #2a2a4a 100%);
+    padding: 12px;
+    font-size: 1rem;
+    font-weight: bold;
+    text-align: center;
+    color: #00d4ff;
+    border-bottom: 2px solid #00d4ff;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+}
+
+.camera-status {
+    font-size: 1.2rem;
+}
+
+.camera-status.status-ok {
+    color: #44ff44;
+}
+
+.camera-status.status-error {
+    color: #ff4444;
+}
+
+.feed-error {
+    background: #1a1a2e;
+    color: #ff4444;
+    padding: 60px 20px;
+    text-align: center;
+    font-size: 1.2rem;
+    font-weight: bold;
+    min-height: 300px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.camera-feed img {
+    width: 100%;
+    height: auto;
+    min-height: 300px;
+    max-height: 500px;
+    object-fit: cover;
+    display: block;
+    background: #1a1a2e;
+}
+
+.camera-stats {
+    padding: 8px 12px;
+    background: #1e1e3f;
+    display: flex;
+    justify-content: space-around;
+    gap: 15px;
+    font-size: 0.85rem;
+    color: #00d4ff;
+    border-top: 1px solid #2a2a4e;
+}
+
+.camera-stats span {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.camera-stats span::before {
+    content: "●";
+    color: #44ff44;
+    font-size: 1.2rem;
+}
+
+.logs-controls {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+button {
+    background: #3a3a5a;
+    color: #e0e0e0;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    transition: background 0.2s;
+}
+
+button:hover {
+    background: #4a4a6a;
+}
+
+.btn-primary {
+    background: #00d4ff;
+    color: #0f0f1e;
+    font-weight: bold;
+}
+
+.btn-primary:hover {
+    background: #00b8e6;
+}
+
+.log-entry {
+    padding: 10px;
+    margin-bottom: 5px;
+    border-radius: 4px;
+    background: #252540;
+    display: flex;
+    gap: 15px;
+    font-size: 0.9rem;
+}
+
+.log-time {
+    color: #888;
+    min-width: 80px;
+}
+
+.log-type {
+    font-weight: bold;
+    min-width: 120px;
+}
+
+.log-info {
+    border-left: 3px solid #00d4ff;
+}
+
+.log-warning {
+    border-left: 3px solid #ffaa00;
+}
+
+.log-error {
+    border-left: 3px solid #ff4444;
+}
+
+.search-form {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.form-group {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.form-group label {
+    font-size: 0.9rem;
+    color: #b0b0b0;
+}
+
+.form-group input {
+    background: #252540;
+    border: 1px solid #3a3a5a;
+    color: #e0e0e0;
+    padding: 8px;
+    border-radius: 4px;
+    font-size: 0.9rem;
+}
+
+.search-result-item {
+    background: #252540;
+    padding: 15px;
+    margin-bottom: 10px;
+    border-radius: 6px;
+    display: flex;
+    gap: 15px;
+}
+
+.result-image img {
+    width: 150px;
+    height: auto;
+    border-radius: 4px;
+}
+
+.result-info {
+    flex: 1;
+}
+
+.result-info p {
+    margin-bottom: 5px;
+    font-size: 0.9rem;
+}
+
+.loading, .empty {
+    text-align: center;
+    color: #888;
+    padding: 20px;
+}
+
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1a1a2e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #3a3a5a;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #4a4a6a;
+}

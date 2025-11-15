@@ -1,0 +1,42 @@
+{
+  "design": "Dense-zone & transfer mitigation via temporally-windowed ownership events in knowledge-graph, scored across embedding_similarity, proximity, color_histogram, camera_role, contextual signals. Each node maintains OwnershipEvent ledger tracking person-bag registration chains with timestamps and location context. Mesh-consensus collects peer votes (alive nodes only) with weighted confidence fusion. Multi-stage alert verification: pending -> N confirmations over M seconds, cross-camera corroboration, staff/checkout zone whitelisting. Ownership transfers explicitly marked (check-in drop-off, hand-off detected). Hysteresis & backoff: raise alert only if confidence drops below threshold AND no recent transfer event recorded AND cross-camera disagreement confirmed.",
+  "kg_schema_summary": "JSON-LD schema for Person, Bag, OwnershipEvent, TransferEvent, LocationNode, NodeState. OwnershipEvent tracks person_id, bag_id, timestamp, event_type (REGISTER/HOLD/TRANSFER_OUT/TRANSFER_IN/CLEAR), confidence, source_node_id, location_signature, camera_role, transfer_token. Time-windowed ownership with 5-minute decay. Transfer events link from_person to to_person for explicit hand-offs.",
+  "algorithm_summary": "Score = 0.35*embedding_sim + 0.25*proximity + 0.20*color + 0.15*camera_role_weight + 0.05*context, then multiply by time_decay and camera_role_weight. Hysteresis: maintain if score > 0.75, clear if score < 0.40, uncertain otherwise. Transfer events (detected within 30sec window) suppress alerts for 10 seconds. Mesh-consensus: broadcast vote, collect peer scores, use consensus if stdev < 0.15. Alert goes through multi-stage verification: whitelist zones suppressed, N=2 confirmations over M=5 seconds from >= 2 cameras required before escalation.",
+  "alert_logic_summary": "Stage 1: Whitelist zone/staff check. Stage 2: Create pending alert if new. Stage 3: Confirmation window (5 sec). Stage 4: Cross-camera agreement (2+ cameras). Stage 5: Escalation with 30-sec backoff + local retry (2 attempts). Broadcast to mesh if consensus_score < 0.5. Notify staff.",
+  "data_model_changes": "Add OwnershipEvent and TransferEvent dataclasses to vision/baggage_linking.py. Extend HashRegistryEntry in mesh/mesh_protocol.py with: ownership_history (List[OwnershipEvent]), transfer_token (Optional[str]), confidence (float), last_update (float), source_node_id (str), location_signature (str). Create knowledge_graph/kg_store.py with KGStore class providing add_ownership_event(), get_ownership_history(bag_id, window_sec=300), get_current_owner(bag_id), get_person_bags(person_id, window_sec=300), add_transfer_event(), query_recent_events(bag_id, window_sec).",
+  "mesh_messages": [
+    { "type": "TRANSFER_EVENT (9)", "fields": ["event_id", "from_person_id", "to_person_id", "bag_id", "timestamp", "location", "transfer_type", "confidence", "verified", "source_node_id"], "max_bytes": 400 },
+    { "type": "OWNERSHIP_VOTE (10)", "fields": ["person_id", "bag_id", "score", "node_id", "timestamp", "embedding_similarity", "proximity_score", "color_similarity", "camera_role", "location_signature"], "max_bytes": 250 },
+    { "type": "LOCATION_SIGNATURE (11)", "fields": ["location_id", "zone_type", "is_staff_zone", "transfer_likely", "timestamp", "node_id"], "max_bytes": 150 }
+  ],
+  "fusion_tips": [
+    "1. L2-normalize embeddings: e_norm = e / (sqrt(sum(e_i^2)) + 1e-6); result unit vector",
+    "2. Quantize to float16 for 50% size reduction: np.float16(embedding) = 1024 bytes vs 2048 for float32",
+    "3. Compress with zlib + base64: zlib.compress(e_bytes, level=6) gives 60-70% smaller; base64 encode for JSON",
+    "4. Cosine similarity: dot(emb1_norm, emb2_norm); single dot product, result in [0,1]",
+    "5. Color histogram: Combine HSV+LAB [36+32+32+32]=132 values; bhattacharyya distance = -ln(sum(sqrt(h1_i*h2_i))); similarity = exp(-dist)",
+    "6. Weighted score: 0.35*emb_sim + 0.25*prox + 0.20*color + 0.15*role_weight; all inputs normalized [0,1]",
+    "7. Time decay: exp(-elapsed_sec / 300); at 2.5min decay=0.71, at 5min decay=0.37, at 10min decay=0.14",
+    "8. Compression example: emb_f16 = np.float16(emb); comp = zlib.compress(emb_f16.tobytes(), 6); enc = base64.b64encode(comp); decomp: emb_f32 = np.frombuffer(zlib.decompress(base64.b64decode(enc)), dtype=np.float16).astype(np.float32)"
+  ],
+  "checklist": [
+    { "priority": 1, "task": "Add OwnershipEvent & TransferEvent dataclasses", "file": "vision/baggage_linking.py", "target": "After ObjectClass enum" },
+    { "priority": 2, "task": "Extend HashRegistryEntry with ownership fields (6 new)", "file": "mesh/mesh_protocol.py", "target": "HashRegistryEntry dataclass line ~103" },
+    { "priority": 3, "task": "Create knowledge_graph/kg_store.py", "file": "knowledge_graph/kg_store.py", "target": "New file; KGStore class with 6 query methods" },
+    { "priority": 4, "task": "Extend MessageType enum (add 9, 10, 11)", "file": "mesh/mesh_protocol.py", "target": "IntEnum + handlers in _handle_message_type()" },
+    { "priority": 5, "task": "Implement OwnershipMatcher class", "file": "vision/baggage_linking.py", "target": "New OwnershipMatcher class; match() method" },
+    { "priority": 6, "task": "Add mesh consensus voting", "file": "mesh/mesh_protocol.py", "target": "broadcast_ownership_vote() + collect_peer_votes()" },
+    { "priority": 7, "task": "Implement AlertVerifier class", "file": "vision/baggage_linking.py", "target": "New AlertVerifier; raise_alert() + escalate_alert()" },
+    { "priority": 8, "task": "Integrate OwnershipMatcher & AlertVerifier", "file": "vision/baggage_linking.py", "target": "BaggageLinking.process_frame()" },
+    { "priority": 9, "task": "Add mesh broadcast methods (transfer, votes)", "file": "mesh/mesh_protocol.py", "target": "broadcast_transfer_event() + broadcast_ownership_vote()" },
+    { "priority": 10, "task": "Integrate kg_store into IntegratedSystem", "file": "integrated_runtime/integrated_system.py", "target": "Init KGStore; pass to BaggageLinking; update after frame" },
+    { "priority": 11, "task": "Add embedding compression utilities", "file": "utils/embedding_utils.py", "target": "New file; compress_embedding() + decompress_embedding()" },
+    { "priority": 12, "task": "Write unit & integration tests", "file": "tests/test_ownership_transfer.py", "target": "New file; test ownership score, transfers, alerts, consensus" }
+  ],
+  "tests_summary": {
+    "unit_test_ownership_score": "Test person-bag matching with high similarity (score>0.75 = MAINTAIN), low similarity (score<0.40 = CLEAR), and hysteresis zone (0.40-0.75 = UNCERTAIN)",
+    "unit_test_transfer_suppression": "Verify transfer event within 30sec window suppresses ownership mismatch alert for 10 seconds",
+    "unit_test_alert_verification": "Test pending alert tracking (1/2 confirmations), confirmation window (5 sec), cross-camera agreement (2+ cameras), backoff (30 sec), escalation with consensus check",
+    "simulation_multibag_scenario": "Frame 1: Alice registers red backpack at check-in (REGISTER event, conf=0.98). Frame 2: Alice transfers bag to staff (TRANSFER_OUT event). Frame 3: Alice picks blue suitcase in store (HOLD event, conf=0.87, multi-bag token). Frame 4: Surveillance sees unknown person with suitcase -> ALERT escalated (conf<0.5)"
+  }
+}

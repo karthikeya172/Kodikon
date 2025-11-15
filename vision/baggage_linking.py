@@ -56,6 +56,105 @@ class LinkingStatus(Enum):
     CONFIRMED = "confirmed"     # Verified mismatch
 
 
+# ============================================================================
+# OWNERSHIP AND TRANSFER DATACLASSES (Phase 1)
+# ============================================================================
+
+@dataclass
+class OwnershipEvent:
+    """Record of person-bag ownership state change"""
+    event_id: str
+    person_id: str
+    bag_id: str
+    timestamp: float
+    event_type: str  # REGISTER, HOLD, TRANSFER_OUT, TRANSFER_IN, CLEAR
+    confidence: float
+    source_node_id: str
+    location_signature: str
+    camera_role: str
+    transfer_token: Optional[str] = None
+    reason: str = ""
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            'event_id': self.event_id,
+            'person_id': self.person_id,
+            'bag_id': self.bag_id,
+            'timestamp': self.timestamp,
+            'event_type': self.event_type,
+            'confidence': self.confidence,
+            'source_node_id': self.source_node_id,
+            'location_signature': self.location_signature,
+            'camera_role': self.camera_role,
+            'transfer_token': self.transfer_token,
+            'reason': self.reason
+        }
+    
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> 'OwnershipEvent':
+        """Create from dictionary"""
+        return OwnershipEvent(
+            event_id=d['event_id'],
+            person_id=d['person_id'],
+            bag_id=d['bag_id'],
+            timestamp=d['timestamp'],
+            event_type=d['event_type'],
+            confidence=d['confidence'],
+            source_node_id=d['source_node_id'],
+            location_signature=d['location_signature'],
+            camera_role=d['camera_role'],
+            transfer_token=d.get('transfer_token'),
+            reason=d.get('reason', '')
+        )
+
+
+@dataclass
+class TransferEvent:
+    """Explicit transfer event between persons"""
+    transfer_id: str
+    from_person_id: str
+    to_person_id: str
+    bag_id: str
+    timestamp: float
+    transfer_type: str  # DROP_OFF, HAND_OFF, PICKUP, EXCHANGE
+    location_signature: str
+    source_node_id: str
+    confidence: float = 1.0
+    notes: str = ""
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization"""
+        return {
+            'transfer_id': self.transfer_id,
+            'from_person_id': self.from_person_id,
+            'to_person_id': self.to_person_id,
+            'bag_id': self.bag_id,
+            'timestamp': self.timestamp,
+            'transfer_type': self.transfer_type,
+            'location_signature': self.location_signature,
+            'source_node_id': self.source_node_id,
+            'confidence': self.confidence,
+            'notes': self.notes
+        }
+    
+    @staticmethod
+    def from_dict(d: Dict[str, Any]) -> 'TransferEvent':
+        """Create from dictionary"""
+        return TransferEvent(
+            transfer_id=d['transfer_id'],
+            from_person_id=d['from_person_id'],
+            to_person_id=d['to_person_id'],
+            bag_id=d['bag_id'],
+            timestamp=d['timestamp'],
+            transfer_type=d['transfer_type'],
+            location_signature=d['location_signature'],
+            source_node_id=d['source_node_id'],
+            confidence=d.get('confidence', 1.0),
+            notes=d.get('notes', '')
+        )
+
+
 @dataclass
 class BoundingBox:
     """Bounding box representation"""
@@ -140,6 +239,7 @@ class Detection:
     frame_id: int = 0
     camera_id: str = ""
     timestamp: datetime = field(default_factory=datetime.now)
+    face_embedding: Optional[np.ndarray] = None
     
     def get_embedding_normalized(self) -> np.ndarray:
         """Get L2-normalized embedding"""
@@ -185,6 +285,7 @@ class BaggageProfile:
     detections: List[Detection] = field(default_factory=list)
     camera_ids: List[str] = field(default_factory=list)
     mismatch_count: int = 0
+    face_embedding: Optional[np.ndarray] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary"""
@@ -200,6 +301,463 @@ class BaggageProfile:
             'mismatch_count': self.mismatch_count,
             'camera_ids': self.camera_ids
         }
+
+
+# ============================================================================
+# OWNERSHIP MATCHER (Phase 4)
+# ============================================================================
+
+class OwnershipMatcher:
+    """
+    Ownership confidence scoring and decision engine.
+    Implements 5-step matching algorithm with hysteresis and transfer suppression.
+    """
+    
+    def __init__(self, kg_store=None):
+        """
+        Initialize ownership matcher.
+        
+        Args:
+            kg_store: Knowledge graph store for ownership history lookup
+        """
+        self.kg_store = kg_store
+        self.last_confident_score: Dict[str, float] = {}  # bag_id -> last high confidence
+        self.transfer_suppression_end: Dict[str, float] = {}  # bag_id -> suppression end time
+        self.transfer_suppression_window = 10.0  # seconds
+        self.maintain_threshold = 0.75
+        self.clear_threshold = 0.40
+        self.backoff_window = 30.0
+        self.lock = threading.Lock()
+    
+    def match(self, person_det: Detection, bag_det: Detection, 
+              ownership_history: List[Dict[str, Any]], 
+              location_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Compute ownership confidence and decision using 5-step algorithm.
+        
+        Args:
+            person_det: Person detection with embedding
+            bag_det: Bag detection with embedding
+            ownership_history: Recent ownership events from KG store
+            location_context: Dict with keys: camera_role, location_signature, zone_type
+        
+        Returns:
+            Dict with keys:
+                - decision: 'MAINTAIN', 'CLEAR', or 'UNCERTAIN'
+                - confidence: Computed confidence score (0.0-1.0)
+                - reason: String explaining decision
+        """
+        with self.lock:
+            try:
+                # Step 1: Compute weighted ownership score
+                score = self._compute_score(person_det, bag_det, 
+                                           ownership_history, location_context)
+                
+                # Step 2: Check transfer suppression window
+                bag_id = bag_det.camera_id  # Use camera_id as temporary bag ID
+                current_time = time.time()
+                
+                if bag_id in self.transfer_suppression_end:
+                    if current_time < self.transfer_suppression_end[bag_id]:
+                        return {
+                            'decision': 'SUPPRESS',
+                            'confidence': score,
+                            'reason': f'Transfer suppression active for {bag_id}'
+                        }
+                    else:
+                        del self.transfer_suppression_end[bag_id]
+                
+                # Step 3: Apply hysteresis logic
+                last_score = self.last_confident_score.get(bag_id, 0.0)
+                
+                if score >= self.maintain_threshold:
+                    decision = 'MAINTAIN'
+                    self.last_confident_score[bag_id] = score
+                    reason = f'Score {score:.3f} >= maintain threshold {self.maintain_threshold}'
+                
+                elif score <= self.clear_threshold:
+                    decision = 'CLEAR'
+                    if bag_id in self.last_confident_score:
+                        del self.last_confident_score[bag_id]
+                    reason = f'Score {score:.3f} <= clear threshold {self.clear_threshold}'
+                
+                else:
+                    # Uncertain zone: maintain previous decision if had high confidence
+                    if last_score >= self.maintain_threshold:
+                        decision = 'MAINTAIN'
+                        reason = f'Score {score:.3f} in uncertain zone; maintaining previous ownership'
+                    else:
+                        decision = 'UNCERTAIN'
+                        reason = f'Score {score:.3f} in uncertain zone {self.clear_threshold}-{self.maintain_threshold}'
+                
+                return {
+                    'decision': decision,
+                    'confidence': score,
+                    'reason': reason
+                }
+            
+            except Exception as e:
+                logger.error(f"Error in match(): {e}")
+                return {
+                    'decision': 'UNCERTAIN',
+                    'confidence': 0.5,
+                    'reason': f'Matching error: {str(e)}'
+                }
+    
+    def _compute_score(self, person_det: Detection, bag_det: Detection,
+                       ownership_history: List[Dict[str, Any]],
+                       location_context: Dict[str, Any]) -> float:
+        """
+        Compute 7-component weighted ownership confidence score.
+        Formula: 0.35*embedding + 0.25*proximity + 0.20*color + 
+                 0.15*role_weight + 0.05*context + time_decay
+        
+        Args:
+            person_det, bag_det: Detection objects
+            ownership_history: Recent ownership events
+            location_context: Zone and camera info
+        
+        Returns:
+            Confidence score (0.0-1.0)
+        """
+        try:
+            # Component 1: Embedding similarity (35% weight)
+            embedding_sim = self._embedding_similarity(
+                person_det.get_embedding_normalized(),
+                bag_det.get_embedding_normalized()
+            )
+            
+            # Component 2: Spatial proximity (25% weight)
+            spatial_dist = person_det.bbox.distance_to(bag_det.bbox)
+            proximity_score = max(0.0, 1.0 - (spatial_dist / 500.0))  # 500px = max distance
+            
+            # Component 3: Color similarity (20% weight)
+            color_sim = self._color_similarity(
+                person_det.color_histogram,
+                bag_det.color_histogram
+            )
+            
+            # Component 4: Camera role weight (15% weight)
+            camera_role = location_context.get('camera_role', 'SURVEILLANCE')
+            role_weight = {
+                'REGISTRATION': 0.9,      # High confidence
+                'SURVEILLANCE': 0.6,      # Medium
+                'CHECKOUT': 0.7,          # Medium-high
+                'TRANSIT': 0.4             # Low
+            }.get(camera_role, 0.5)
+            
+            # Component 5: Location context (5% weight)
+            zone_type = location_context.get('zone_type', 'general')
+            context_score = {
+                'staff_zone': 0.2,        # Lower confidence for staff zones
+                'check_in': 0.3,          # Lower for check-in (hand-off zones)
+                'store': 0.5,             # Medium for retail
+                'general': 0.6            # Higher for general transit
+            }.get(zone_type, 0.5)
+            
+            # Component 6: Time decay from ownership history
+            time_decay = self._compute_time_decay(ownership_history)
+            
+            # Weighted combination
+            score = (0.35 * embedding_sim +
+                    0.25 * proximity_score +
+                    0.20 * color_sim +
+                    0.15 * role_weight +
+                    0.05 * context_score)
+            
+            # Apply time decay (exponential decay over 5 min window)
+            score = score * time_decay
+            
+            return max(0.0, min(1.0, score))
+        
+        except Exception as e:
+            logger.error(f"Error computing ownership score: {e}")
+            return 0.5
+    
+    def _embedding_similarity(self, emb1: np.ndarray, emb2: np.ndarray) -> float:
+        """Compute cosine similarity between embeddings"""
+        try:
+            if emb1 is None or emb2 is None:
+                return 0.0
+            
+            # Cosine similarity: dot product of normalized vectors
+            sim = np.dot(emb1, emb2)
+            return max(0.0, min(1.0, sim))
+        except:
+            return 0.0
+    
+    def _color_similarity(self, hist1: ColorHistogram, hist2: ColorHistogram) -> float:
+        """Compute color histogram similarity"""
+        try:
+            if hist1 is None or hist2 is None:
+                return 0.0
+            
+            # Chi-square distance for histograms
+            def chi_square(h1, h2):
+                return np.sum((h1 - h2) ** 2 / (h1 + h2 + 1e-6))
+            
+            h_dist = chi_square(hist1.h_hist, hist2.h_hist)
+            s_dist = chi_square(hist1.s_hist, hist2.s_hist)
+            v_dist = chi_square(hist1.v_hist, hist2.v_hist)
+            
+            avg_dist = (h_dist + s_dist + v_dist) / 3.0
+            similarity = 1.0 / (1.0 + avg_dist)
+            return max(0.0, min(1.0, similarity))
+        except:
+            return 0.0
+    
+    def _compute_time_decay(self, ownership_history: List[Dict[str, Any]]) -> float:
+        """
+        Compute exponential time decay based on ownership history recency.
+        Decays to 0.5 after 5 minutes.
+        """
+        try:
+            if not ownership_history:
+                return 1.0
+            
+            # Get most recent ownership event
+            recent = ownership_history[0]  # Assumed sorted by recency
+            event_time = recent.get('timestamp', time.time())
+            age_sec = time.time() - event_time
+            
+            # Exponential decay: exp(-age / 300)  -> 0.5 at 5 min
+            decay = np.exp(-age_sec / 300.0)
+            return max(0.5, min(1.0, decay))
+        except:
+            return 1.0
+    
+    def suppress_alerts_for_transfer(self, bag_id: str) -> None:
+        """Suppress alerts for bag_id for transfer_suppression_window seconds"""
+        with self.lock:
+            self.transfer_suppression_end[bag_id] = time.time() + self.transfer_suppression_window
+
+
+# ============================================================================
+# ALERT VERIFIER (Phase 5)
+# ============================================================================
+
+class AlertVerifier:
+    """
+    Multi-stage alert verification system.
+    Implements 5-stage verification pipeline before escalation.
+    """
+    
+    def __init__(self, mesh_protocol=None, kg_store=None):
+        """
+        Initialize alert verifier.
+        
+        Args:
+            mesh_protocol: MeshProtocol instance for peer voting
+            kg_store: KGStore instance for ownership queries
+        """
+        self.mesh_protocol = mesh_protocol
+        self.kg_store = kg_store
+        
+        # Configuration thresholds
+        self.min_confirmations = 2
+        self.confirmation_window_sec = 5.0
+        self.min_cameras_for_agreement = 2
+        self.backoff_window_sec = 30.0
+        
+        # State tracking
+        self.pending_alerts: Dict[str, Dict[str, Any]] = {}  # bag_id -> alert info
+        self.confirmed_alerts: Dict[str, float] = {}         # bag_id -> confirm time
+        self.alert_backoff_end: Dict[str, float] = {}        # bag_id -> backoff end time
+        
+        # Whitelist zones and staff
+        self.whitelist_zones = {'staff_zone', 'checkout', 'check_in_counter'}
+        self.staff_registry = set()  # staff person IDs
+        
+        self.lock = threading.Lock()
+    
+    def raise_alert(self, bag_id: str, person_id: str, mismatch_type: str,
+                   confidence: float, location_context: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute 5-stage alert verification pipeline.
+        
+        Args:
+            bag_id: Bag identifier
+            person_id: Person carrying bag
+            mismatch_type: Type of mismatch (UNOWNED, SUSPICIOUS, ESCALATED)
+            confidence: Confidence score (0.0-1.0)
+            location_context: Dict with zone_type, camera_role, location_signature
+        
+        Returns:
+            Dict with keys:
+                - action: 'ALERT', 'PENDING', 'SUPPRESS', or 'ESCALATE'
+                - stage: Int indicating which stage (1-5)
+                - reason: String explaining action
+        """
+        with self.lock:
+            try:
+                current_time = time.time()
+                
+                # Stage 1: Whitelist zone check
+                zone_type = location_context.get('zone_type', 'general')
+                if zone_type in self.whitelist_zones:
+                    return {
+                        'action': 'SUPPRESS',
+                        'stage': 1,
+                        'reason': f'Alert suppressed for whitelist zone: {zone_type}'
+                    }
+                
+                # Stage 1: Staff check
+                if person_id in self.staff_registry:
+                    return {
+                        'action': 'SUPPRESS',
+                        'stage': 1,
+                        'reason': f'Alert suppressed for staff member: {person_id}'
+                    }
+                
+                # Stage 2: Backoff check
+                if bag_id in self.alert_backoff_end:
+                    if current_time < self.alert_backoff_end[bag_id]:
+                        return {
+                            'action': 'SUPPRESS',
+                            'stage': 2,
+                            'reason': f'Alert backoff active for {bag_id}'
+                        }
+                    else:
+                        del self.alert_backoff_end[bag_id]
+                
+                # Stage 3: Pending alert confirmation window
+                if bag_id not in self.pending_alerts:
+                    # Create new pending alert
+                    self.pending_alerts[bag_id] = {
+                        'timestamp': current_time,
+                        'person_id': person_id,
+                        'mismatch_type': mismatch_type,
+                        'confidence': confidence,
+                        'confirmations': 1,
+                        'cameras': {location_context.get('location_signature', 'unknown')}
+                    }
+                    return {
+                        'action': 'PENDING',
+                        'stage': 3,
+                        'reason': f'Pending alert for {bag_id}; awaiting confirmations'
+                    }
+                else:
+                    # Existing pending alert - accumulate confirmations
+                    pending = self.pending_alerts[bag_id]
+                    age_sec = current_time - pending['timestamp']
+                    
+                    if age_sec > self.confirmation_window_sec:
+                        # Window expired, reset
+                        del self.pending_alerts[bag_id]
+                        self.pending_alerts[bag_id] = {
+                            'timestamp': current_time,
+                            'person_id': person_id,
+                            'mismatch_type': mismatch_type,
+                            'confidence': confidence,
+                            'confirmations': 1,
+                            'cameras': {location_context.get('location_signature', 'unknown')}
+                        }
+                        return {
+                            'action': 'PENDING',
+                            'stage': 3,
+                            'reason': f'Confirmation window expired; restarting'
+                        }
+                    
+                    # Within window - accumulate
+                    pending['confirmations'] += 1
+                    pending['cameras'].add(location_context.get('location_signature', 'unknown'))
+                    pending['confidence'] = max(pending['confidence'], confidence)
+                    
+                    # Check if enough confirmations
+                    if pending['confirmations'] < self.min_confirmations:
+                        return {
+                            'action': 'PENDING',
+                            'stage': 3,
+                            'reason': f'Pending alert {pending["confirmations"]}/{self.min_confirmations} confirmations'
+                        }
+                
+                # Stage 4: Cross-camera agreement check
+                num_cameras = len(self.pending_alerts[bag_id]['cameras'])
+                if num_cameras < self.min_cameras_for_agreement:
+                    return {
+                        'action': 'PENDING',
+                        'stage': 4,
+                        'reason': f'Awaiting cross-camera confirmation ({num_cameras}/{self.min_cameras_for_agreement})'
+                    }
+                
+                # Stage 5: Escalation with mesh consensus
+                return self._escalate_alert(bag_id, self.pending_alerts[bag_id])
+            
+            except Exception as e:
+                logger.error(f"Error in raise_alert(): {e}")
+                return {
+                    'action': 'SUPPRESS',
+                    'stage': 0,
+                    'reason': f'Alert verification error: {str(e)}'
+                }
+    
+    def _escalate_alert(self, bag_id: str, alert_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute Stage 5 escalation with peer consensus voting.
+        
+        Args:
+            bag_id: Bag identifier
+            alert_info: Pending alert information
+        
+        Returns:
+            Alert action decision
+        """
+        try:
+            # Request ownership votes from peers via mesh
+            if self.mesh_protocol:
+                vote_data = {
+                    'bag_id': bag_id,
+                    'person_id': alert_info.get('person_id'),
+                    'confidence': alert_info.get('confidence', 0.5),
+                    'camera_role': 'SURVEILLANCE',
+                    'location_signature': '',
+                    'reason': 'Alert escalation consensus vote',
+                    'timestamp': time.time()
+                }
+                self.mesh_protocol.broadcast_ownership_vote(vote_data)
+            
+            # Clear pending and set backoff
+            if bag_id in self.pending_alerts:
+                del self.pending_alerts[bag_id]
+            
+            self.alert_backoff_end[bag_id] = time.time() + self.backoff_window_sec
+            
+            # Confirmed alert - will be escalated to system
+            self.confirmed_alerts[bag_id] = time.time()
+            
+            return {
+                'action': 'ALERT',
+                'stage': 5,
+                'reason': f'Baggage mismatch confirmed for {bag_id}; escalating'
+            }
+        
+        except Exception as e:
+            logger.error(f"Error escalating alert: {e}")
+            return {
+                'action': 'SUPPRESS',
+                'stage': 5,
+                'reason': f'Escalation error: {str(e)}'
+            }
+    
+    def add_staff_member(self, person_id: str) -> None:
+        """Add person ID to staff registry"""
+        with self.lock:
+            self.staff_registry.add(person_id)
+    
+    def remove_staff_member(self, person_id: str) -> None:
+        """Remove person ID from staff registry"""
+        with self.lock:
+            self.staff_registry.discard(person_id)
+    
+    def get_confirmed_alerts(self) -> List[str]:
+        """Get list of confirmed alert bag IDs"""
+        with self.lock:
+            return list(self.confirmed_alerts.keys())
+    
+    def clear_confirmed_alert(self, bag_id: str) -> None:
+        """Clear confirmed alert (resolved)"""
+        with self.lock:
+            self.confirmed_alerts.pop(bag_id, None)
 
 
 # ============================================================================
@@ -803,12 +1361,15 @@ class DescriptionSearchEngine:
 class BaggageLinking:
     """Complete baggage linking pipeline with all components"""
     
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None,
+                 kg_store=None, mesh_protocol=None):
         """
         Initialize complete baggage linking system
         
         Args:
             config: Configuration dictionary with model parameters
+            kg_store: KGStore instance for ownership tracking (Phase 6)
+            mesh_protocol: MeshProtocol instance for mesh communication (Phase 6)
         """
         self.logger = logging.getLogger(__name__)
         self.config = config or {}
@@ -835,6 +1396,12 @@ class BaggageLinking:
         )
         
         self.search_engine = DescriptionSearchEngine()
+        
+        # Phase 6: Ownership tracking components
+        self.kg_store = kg_store
+        self.mesh_protocol = mesh_protocol
+        self.ownership_matcher = OwnershipMatcher(kg_store=kg_store)
+        self.alert_verifier = AlertVerifier(mesh_protocol=mesh_protocol, kg_store=kg_store)
         
         # State tracking
         self.detected_bags = defaultdict(dict)  # camera_id -> {bag_id: BaggageProfile}
@@ -906,8 +1473,55 @@ class BaggageLinking:
                 self.detected_bags[camera_id][bag_id] = profile
                 self.search_engine.add_baggage(profile)
         
-        # Step 5: Detect mismatches (in surveillance mode)
+        # Phase 6: Ownership matching (NEW)
+        # For each person-bag link, apply ownership matching with historical context
+        if self.kg_store and self.ownership_matcher:
+            for link in links:
+                try:
+                    person_det = link.person_detection
+                    bag_det = link.bag_detection
+                    if not person_det or not bag_det:
+                        continue
+                    
+                    # Get ownership history from KG store
+                    bag_id = link.bag_id
+                    ownership_history = self.kg_store.get_ownership_history(bag_id, limit=5)
+                    
+                    # Prepare location context
+                    location_context = {
+                        'camera_role': 'SURVEILLANCE',  # Default; override from config
+                        'zone_type': 'general',         # Default; override from config
+                        'location_signature': camera_id
+                    }
+                    
+                    # Compute ownership score
+                    match_result = self.ownership_matcher.match(
+                        person_det, bag_det, ownership_history, location_context
+                    )
+                    
+                    # If matched, create ownership event
+                    if match_result['decision'] in ['MAINTAIN', 'UNCERTAIN']:
+                        ownership_event = {
+                            'event_id': f"{camera_id}_{frame_id}_{link.bag_id}",
+                            'person_id': link.person_id,
+                            'bag_id': link.bag_id,
+                            'timestamp': time.time(),
+                            'event_type': 'HOLD',
+                            'confidence': match_result['confidence'],
+                            'source_node_id': camera_id,
+                            'location_signature': camera_id,
+                            'camera_role': location_context['camera_role'],
+                            'transfer_token': None,
+                            'reason': match_result['reason']
+                        }
+                        self.kg_store.add_ownership_event(ownership_event)
+                
+                except Exception as e:
+                    self.logger.error(f"Error in ownership matching: {e}")
+        
+        # Step 5: Detect mismatches and apply alert verification (MODIFIED)
         mismatches = []
+        alerts = []
         for person in persons:
             # Check if person has registered bag
             for link in links:
@@ -917,12 +1531,37 @@ class BaggageLinking:
                         camera_id, link.person_id, link.bag_detection
                     )
                     if is_mismatch:
-                        mismatches.append({
+                        mismatch_info = {
                             'person_id': link.person_id,
                             'expected_bag': 'unknown',
                             'current_bag': link.bag_id,
                             'reason': reason
-                        })
+                        }
+                        mismatches.append(mismatch_info)
+                        
+                        # Phase 6: Alert verification (NEW)
+                        if self.alert_verifier:
+                            try:
+                                location_context = {
+                                    'zone_type': 'general',
+                                    'camera_role': 'SURVEILLANCE',
+                                    'location_signature': camera_id
+                                }
+                                alert_action = self.alert_verifier.raise_alert(
+                                    bag_id=link.bag_id,
+                                    person_id=link.person_id,
+                                    mismatch_type='SUSPICIOUS',
+                                    confidence=0.7,
+                                    location_context=location_context
+                                )
+                                alerts.append({
+                                    'bag_id': link.bag_id,
+                                    'action': alert_action['action'],
+                                    'stage': alert_action['stage'],
+                                    'reason': alert_action['reason']
+                                })
+                            except Exception as e:
+                                self.logger.error(f"Error in alert verification: {e}")
         
         with self.lock:
             self.person_bag_links.extend(links)
@@ -936,6 +1575,7 @@ class BaggageLinking:
             'bags': bags,
             'links': links,
             'mismatches': mismatches,
+            'alerts': alerts if alerts else [],  # Phase 6: Include alerts
             'processing_time_ms': (time.time() - start_time) * 1000
         }
     

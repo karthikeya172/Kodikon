@@ -157,14 +157,13 @@ class MotionAnalyzer:
             metrics = MotionMetrics()
             
             if self.prev_frame is not None:
-                # Calculate optical flow
+                # Calculate optical flow (OpenCV 4.x compatible)
                 flow = cv2.calcOpticalFlowFarneback(
                     self.prev_frame, gray, None,
                     pyr_scale=0.5,
                     levels=3,
                     winsize=15,
                     iterations=3,
-                    n8=False,
                     poly_n=5,
                     poly_sigma=1.2,
                     flags=0
@@ -180,7 +179,7 @@ class MotionAnalyzer:
                 metrics.motion_area_percentage = float(np.sum(motion_mask) / motion_mask.size)
                 
                 # Count motion regions
-                _, contours, _ = cv2.findContours(
+                contours, _ = cv2.findContours(
                     motion_mask.astype(np.uint8),
                     cv2.RETR_EXTERNAL,
                     cv2.CHAIN_APPROX_SIMPLE

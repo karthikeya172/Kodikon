@@ -1,0 +1,27 @@
+# Camera Configuration
+# Update these URLs to match your IP camera streams
+
+cameras:
+  - id: cam1
+    name: "Camera 1"
+    url: "http://10.197.139.199:8080/video"
+    enabled: true
+    
+  - id: cam2
+    name: "Camera 2"
+    url: "http://10.197.139.108:8080/video"
+    enabled: true
+    
+  - id: cam3
+    name: "Camera 3"
+    url: "http://10.197.139.192:8080/video"
+    enabled: true
+
+# Fallback to local camera if IP cameras fail
+fallback_to_local: true
+local_camera_id: 0
+
+# Camera settings
+fps: 30
+frame_skip: 1
+timeout: 5.0

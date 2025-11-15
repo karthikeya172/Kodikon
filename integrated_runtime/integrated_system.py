@@ -37,8 +37,11 @@ from power.power_mode_controller import PowerModeController, PowerMode, PowerCon
 from vision.baggage_linking import (
     BaggageLinking, YOLODetectionEngine, EmbeddingExtractor,
     ColorDescriptor, BaggageProfile, PersonBagLink, LinkingStatus,
-    Detection, ObjectClass
+    Detection, ObjectClass, BoundingBox
 )
+from knowledge_graph.kg_store import KGStore  # Phase 6: Ownership tracking
+import base64
+from collections import deque
 
 
 # ============================================================================
@@ -88,6 +91,42 @@ class SystemMetrics:
     current_power_mode: PowerMode = PowerMode.BALANCED
     battery_level: float = 100.0
     alerts_count: int = 0
+
+
+class FrameHistoryBuffer:
+    """Buffer for storing recent frames with timestamps"""
+    
+    def __init__(self, max_size: int = 300):
+        self.max_size = max_size
+        self.frames = deque(maxlen=max_size)
+        self.lock = threading.Lock()
+    
+    def append_frame(self, frame: np.ndarray, timestamp: float):
+        """Add frame to history"""
+        with self.lock:
+            self.frames.append((frame.copy(), timestamp))
+    
+    def get_frame_history(self, start_time: float = None, end_time: float = None) -> List[Tuple[np.ndarray, float]]:
+        """Get frames within time range"""
+        with self.lock:
+            if start_time is None and end_time is None:
+                return list(self.frames)
+            
+            result = []
+            for frame, ts in self.frames:
+                if start_time and ts < start_time:
+                    continue
+                if end_time and ts > end_time:
+                    continue
+                result.append((frame, ts))
+            return result
+    
+    def get_latest_frame(self) -> Optional[Tuple[np.ndarray, float]]:
+        """Get most recent frame"""
+        with self.lock:
+            if self.frames:
+                return self.frames[-1]
+            return None
 
 
 # ============================================================================
@@ -230,6 +269,7 @@ class IntegratedSystem:
         self.yolo_engine = None
         self.embedding_extractor = None
         self.color_descriptor = ColorDescriptor()
+        self.kg_store = None  # Phase 6: Knowledge graph store for ownership tracking
         
         # Cameras
         self.cameras: Dict[str, CameraWorker] = {}
@@ -250,6 +290,28 @@ class IntegratedSystem:
         # Performance tracking
         self.frame_times = deque(maxlen=30)
         self.last_mesh_sync = time.time()
+        
+        # Frame history for backtracking
+        self.frame_history = FrameHistoryBuffer(max_size=300)
+        
+        # Person event log
+        self.person_events = deque(maxlen=500)
+        self.person_events_lock = threading.Lock()
+        
+        # Current frame for Command Centre
+        self.current_frame = None
+        self.current_frame_lock = threading.Lock()
+        self.current_camera_id = None
+        
+        # WebSocket manager reference (set by command centre)
+        self.ws_manager = None
+        
+        # Registration mode state
+        self.registration_mode = False
+        self.registration_state = "IDLE"  # IDLE, WAITING_FOR_ARRIVAL, FREEZE_FRAME, EXTRACT_FEATURES
+        self.registration_freeze_time = None
+        self.registration_frame = None
+        self.last_registration_record = None
         
         # Setup signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -273,6 +335,30 @@ class IntegratedSystem:
                 'reid': {'model': 'osnet_x1_0', 'embedding_dim': 512},
                 'power': {'mode': 'balanced', 'min_fps': 10, 'max_fps': 30},
                 'mesh': {'udp_port': 9999, 'heartbeat_interval': 5}
+            }
+    
+    def _load_camera_config(self) -> dict:
+        """Load camera configuration from YAML file"""
+        camera_config_path = Path(__file__).parent.parent / "config" / "cameras.yaml"
+        
+        try:
+            with open(camera_config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            self.logger.info(f"Loaded camera config from {camera_config_path}")
+            return config
+        except Exception as e:
+            self.logger.warning(f"Failed to load camera config: {e}, using defaults")
+            return {
+                'cameras': [
+                    {'id': 'cam1', 'name': 'Camera 1', 'url': 'http://10.7.74.56:8080/video', 'enabled': True},
+                    {'id': 'cam2', 'name': 'Camera 2', 'url': 'http://10.7.74.165:8080/video', 'enabled': True},
+                    {'id': 'cam3', 'name': 'Camera 3', 'url': 'http://10.7.74.168:8080/video', 'enabled': True}
+                ],
+                'fallback_to_local': True,
+                'local_camera_id': 0,
+                'fps': 30,
+                'frame_skip': 1,
+                'timeout': 5.0
             }
     
     def initialize(self):
@@ -300,9 +386,17 @@ class IntegratedSystem:
             # Initialize power manager
             self.logger.info("Initializing power management...")
             power_cfg = self.config.get('power', {})
-            self.power = PowerModeController()
+            # Create power config with desired mode
+            from power.power_mode_controller import PowerConfig
+            power_config = PowerConfig()
             mode_str = power_cfg.get('mode', 'balanced').upper()
-            self.power.set_power_mode(PowerMode[mode_str])
+            if mode_str in ['ECO', 'BALANCED', 'PERFORMANCE']:
+                power_config.current_mode = PowerMode[mode_str]
+            self.power = PowerModeController(config=power_config)
+            
+            # Phase 6: Initialize knowledge graph store
+            self.logger.info("Initializing knowledge graph store...")
+            self.kg_store = KGStore(persist_path="kg_store.json")
             
             # Initialize mesh networking
             self.logger.info("Initializing mesh network...")
@@ -314,13 +408,70 @@ class IntegratedSystem:
                 heartbeat_timeout=mesh_cfg.get('heartbeat_timeout', 30)
             )
             
+            # Initialize vision subsystem with KGStore and MeshProtocol (Phase 6)
+            self.logger.info("Initializing baggage linking...")
+            vision_cfg = self.config.get('vision', {})
+            self.vision = BaggageLinking(
+                config=vision_cfg,
+                kg_store=self.kg_store,
+                mesh_protocol=self.mesh
+            )
+            
             # Initialize cameras
             self.logger.info("Initializing cameras...")
             camera_cfg = self.config.get('camera', {})
             fps_config = (camera_cfg.get('fps', 30), 1)
-            camera = CameraWorker("camera-0", source=0, fps_config=fps_config)
-            self.cameras["camera-0"] = camera
-            camera.start()
+            
+            # Load camera configuration
+            cameras_config = self._load_camera_config()
+            
+            cameras_started = 0
+            for cam_config in cameras_config.get('cameras', []):
+                if not cam_config.get('enabled', True):
+                    continue
+                
+                cam_id = cam_config['id']
+                source = cam_config['url']
+                
+                try:
+                    self.logger.info(f"Attempting to start {cam_id} from {source}...")
+                    camera = CameraWorker(cam_id, source=source, fps_config=fps_config)
+                    self.cameras[cam_id] = camera
+                    camera.start()
+                    
+                    # Wait a bit to see if camera opens
+                    time.sleep(0.5)
+                    if camera.state == CameraState.CAPTURING:
+                        self.logger.info(f"✓ Started camera: {cam_id}")
+                        cameras_started += 1
+                    else:
+                        self.logger.warning(f"✗ Camera {cam_id} failed to start")
+                        camera.stop()
+                        del self.cameras[cam_id]
+                except Exception as e:
+                    self.logger.error(f"✗ Failed to start camera {cam_id}: {e}")
+            
+            # Fallback to local camera if no IP cameras started
+            if cameras_started == 0 and cameras_config.get('fallback_to_local', True):
+                self.logger.info("No IP cameras available, falling back to local camera...")
+                try:
+                    local_id = cameras_config.get('local_camera_id', 0)
+                    camera = CameraWorker("local-camera", source=local_id, fps_config=fps_config)
+                    self.cameras["local-camera"] = camera
+                    camera.start()
+                    time.sleep(0.5)
+                    if camera.state == CameraState.CAPTURING:
+                        self.logger.info("✓ Started local camera")
+                        cameras_started += 1
+                    else:
+                        self.logger.warning("✗ Local camera failed to start")
+                except Exception as e:
+                    self.logger.error(f"✗ Failed to start local camera: {e}")
+            
+            if cameras_started == 0:
+                self.logger.warning("⚠ No cameras available - system will run without video input")
+            else:
+                self.logger.info(f"✓ {cameras_started} camera(s) initialized")
             
             # Register mesh handlers
             self._register_mesh_handlers()
@@ -370,38 +521,53 @@ class IntegratedSystem:
         
         try:
             while self.running:
-                # Get frame from primary camera
-                result = self.cameras["camera-0"].get_frame(timeout=0.1)
-                if result is None:
+                # Process frames from all cameras
+                frames_processed = False
+                
+                for cam_id, camera in self.cameras.items():
+                    result = camera.get_frame(timeout=0.01)
+                    if result is None:
+                        continue
+                    
+                    frame_id, frame, timestamp = result
+                    frame_counter += 1
+                    frames_processed = True
+                    process_start = time.time()
+                    
+                    # Store frame in history
+                    self.frame_history.append_frame(frame, timestamp)
+                    
+                    # Update current frame for Command Centre (use first available)
+                    with self.current_frame_lock:
+                        if self.current_frame is None or cam_id == "cam1":
+                            self.current_frame = frame.copy()
+                            self.current_camera_id = cam_id
+                    
+                    # Adaptive processing based on power mode
+                    power_config = self.power.config
+                    should_process_yolo = frame_counter % self._get_yolo_interval() == 0
+                    
+                    # Process frame
+                    metadata = self._process_frame(frame, timestamp, frame_id, should_process_yolo)
+                    
+                    # Update metrics
+                    process_time = (time.time() - process_start) * 1000
+                    self.frame_times.append(process_time)
+                    metadata.processing_time_ms = process_time
+                    self.metrics.total_frames_processed += 1
+                    self.metrics.avg_processing_time_ms = np.mean(list(self.frame_times))
+                
+                if not frames_processed:
                     time.sleep(0.01)
-                    continue
-                
-                frame_id, frame, timestamp = result
-                frame_counter += 1
-                process_start = time.time()
-                
-                # Adaptive processing based on power mode
-                power_config = self.power.config
-                should_process_yolo = frame_counter % self._get_yolo_interval() == 0
-                
-                # Process frame
-                metadata = self._process_frame(frame, timestamp, frame_id, should_process_yolo)
-                
-                # Update metrics
-                process_time = (time.time() - process_start) * 1000
-                self.frame_times.append(process_time)
-                metadata.processing_time_ms = process_time
-                self.metrics.total_frames_processed += 1
-                self.metrics.avg_processing_time_ms = np.mean(list(self.frame_times))
                 
                 # Log occasionally
                 if frame_counter % 30 == 0:
-                    fps = 30.0 / np.mean(list(self.frame_times)) if self.frame_times else 0
+                    fps = 1000.0 / self.metrics.avg_processing_time_ms if self.metrics.avg_processing_time_ms > 0 else 0
                     self.logger.debug(
                         f"Processed {frame_counter} frames | "
                         f"Avg FPS: {fps:.1f} | "
-                        f"Detections: {metadata.detections_count} | "
-                        f"Links: {metadata.links_found}"
+                        f"Detections: {self.metrics.total_detections} | "
+                        f"Links: {self.metrics.total_links_found}"
                     )
         
         except Exception as e:
@@ -483,11 +649,15 @@ class IntegratedSystem:
                         data=mismatch
                     )
             
+            # Emit person events
+            for detection in detections:
+                if detection.class_name == ObjectClass.PERSON:
+                    self._emit_person_event("person_in", f"p_{detection.bbox.to_int_coords()}", timestamp)
+            
             # Update power mode adaptively
-            activity_density = self.power.calculate_activity_density(
-                motion_metrics, len(detections)
-            )
-            self.power.update_adaptive_mode(activity_density)
+            activity_density = self.power.analyze_frame(frame, detections)
+            self.power.update_tracking(len(links))
+            self.power.update_power_mode()
             self.metrics.current_power_mode = self.power.config.current_mode
         
         except Exception as e:
@@ -657,13 +827,17 @@ class IntegratedSystem:
         
         try:
             while self.running:
-                # Get frame
-                result = self.cameras["camera-0"].get_frame(timeout=0.5)
-                if result is None:
+                # Get frame from first available camera
+                frame = None
+                for cam_id, camera in self.cameras.items():
+                    result = camera.get_frame(timeout=0.1)
+                    if result is not None:
+                        _, frame, _ = result
+                        break
+                
+                if frame is None:
                     time.sleep(0.01)
                     continue
-                
-                _, frame, _ = result
                 
                 # Draw overlays
                 frame_overlay = frame.copy()
@@ -678,6 +852,25 @@ class IntegratedSystem:
                     self.running = False
                 elif key == ord('s'):
                     self._trigger_search_ui()
+                
+                # NEW: Registration mode handling
+                elif key == ord('r') or key == ord('R'):
+                    self.registration_mode = not self.registration_mode
+                    self.registration_state = "IDLE"
+                    self.logger.info(f"Registration mode: {'ON' if self.registration_mode else 'OFF'}")
+                
+                elif key == ord(' '):  # SPACE
+                    if self.registration_mode and self.registration_state == "WAITING_FOR_ARRIVAL":
+                        self.registration_state = "FREEZE_FRAME"
+                        self.registration_freeze_time = time.time()
+                        self.registration_frame = frame_overlay.copy()
+                        self.logger.info("Frame frozen for registration")
+                
+                elif key == 27:  # ESC
+                    if self.registration_mode:
+                        self.registration_mode = False
+                        self.registration_state = "IDLE"
+                        self.logger.info("Registration cancelled")
         
         except Exception as e:
             self.logger.error(f"Visualization error: {e}")
@@ -720,6 +913,44 @@ class IntegratedSystem:
                     f"Alert: {latest_alert[:50]}...",
                     (10, h - 20), font, 0.7, (0, 0, 255), 2
                 )
+        
+        # NEW: Registration mode overlay
+        if self.registration_mode:
+            if self.registration_state == "IDLE":
+                # Waiting for user to press SPACE
+                cv2.putText(frame, "[REGISTRATION MODE] Press SPACE to freeze", 
+                           (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            elif self.registration_state == "WAITING_FOR_ARRIVAL":
+                cv2.putText(frame, "[WAITING] Person + Bag must be visible", 
+                           (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            
+            elif self.registration_state == "FREEZE_FRAME":
+                elapsed = time.time() - self.registration_freeze_time
+                countdown = max(0, 1.0 - elapsed)
+                cv2.putText(frame, 
+                           f"[FREEZE] {countdown:.1f}s", 
+                           (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+                
+                # Draw center overlay
+                cv2.putText(frame, 
+                           f"{int(countdown * 3)}...", 
+                           (w//2 - 50, h//2), cv2.FONT_HERSHEY_SIMPLEX, 3.0, (0, 255, 0), 3)
+                
+                # After 1 second, extract features
+                if elapsed > 1.0 and self.registration_state == "FREEZE_FRAME":
+                    self.registration_state = "EXTRACT_FEATURES"
+                    # Trigger registration async
+                    threading.Thread(target=self._process_registration, daemon=True).start()
+            
+            elif self.registration_state == "EXTRACT_FEATURES":
+                if self.last_registration_record:
+                    cv2.putText(frame, 
+                               f"✓ Registered: {self.last_registration_record.hash_id[:8]}", 
+                               (10, h - 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    # Show for 2 seconds
+                    if time.time() - self.registration_freeze_time > 3.0:
+                        self.registration_state = "IDLE"
     
     # ========================================================================
     # MESH SYNCHRONIZATION
@@ -820,6 +1051,44 @@ class IntegratedSystem:
         except Exception as e:
             self.logger.error(f"Search handler error: {e}")
     
+    def _process_registration(self):
+        """Process the frozen frame for registration"""
+        try:
+            if self.registration_frame is None or self.yolo_engine is None:
+                self.logger.warning("Registration frame or YOLO not available")
+                self.registration_state = "IDLE"
+                return
+            
+            # Import registration functions
+            from baggage_linking import register_from_frame
+            
+            # Create mesh node wrapper if needed
+            record, success = register_from_frame(
+                frame=self.registration_frame,
+                mesh_node=self.mesh,
+                yolo_model=self.yolo_engine.model if hasattr(self.yolo_engine, 'model') else None,
+                camera_id=self.node_id,
+                metadata={'timestamp': time.time(), 'mode': 'integrated_system'}
+            )
+            
+            if success:
+                self.last_registration_record = record
+                self.logger.info(f"✓ Registration successful: {record.hash_id}")
+                # Add alert
+                with self.alerts_lock:
+                    self.alerts.append(f"✓ Registered person-bag: {record.hash_id[:8]}")
+            else:
+                self.logger.warning("✗ Registration failed: Invalid detection")
+                self.registration_state = "WAITING_FOR_ARRIVAL"
+                with self.alerts_lock:
+                    self.alerts.append("✗ Registration failed: Person + bag must be visible")
+                
+        except Exception as e:
+            self.logger.error(f"Registration processing error: {e}", exc_info=True)
+            self.registration_state = "IDLE"
+            with self.alerts_lock:
+                self.alerts.append(f"✗ Registration error: {str(e)[:40]}")
+    
     def _search_baggage(self, query: Dict) -> List[BaggageProfile]:
         """
         Search baggage profiles by criteria.
@@ -901,6 +1170,169 @@ class IntegratedSystem:
                 'priority': priority,
                 'timestamp': time.time()
             })
+        
+        # Emit to WebSocket
+        if self.ws_manager:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.ws_manager.send_alert(priority, {
+                        'message': message,
+                        'timestamp': time.time()
+                    }))
+            except:
+                pass
+    
+    def _emit_person_event(self, event_type: str, person_id: str, timestamp: float):
+        """Emit person in/out event"""
+        event = {
+            'type': event_type,
+            'person_id': person_id,
+            'timestamp': timestamp
+        }
+        
+        with self.person_events_lock:
+            self.person_events.append(event)
+        
+        # Emit to WebSocket
+        if self.ws_manager:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.ws_manager.send_person_event(event_type, person_id, timestamp))
+            except:
+                pass
+    
+    # ========================================================================
+    # COMMAND CENTRE API METHODS
+    # ========================================================================
+    
+    def get_status_snapshot(self) -> Dict:
+        """Get current system status for Command Centre"""
+        with self.mesh.peers_lock if self.mesh else threading.Lock():
+            peer_count = len(self.mesh.peers) if self.mesh else 0
+        
+        avg_time = self.metrics.avg_processing_time_ms
+        fps = 1000.0 / avg_time if avg_time > 0 else 0
+        
+        # Get camera statuses
+        cameras = []
+        for cam_id, camera in self.cameras.items():
+            cameras.append({
+                'camera_id': cam_id,
+                'fps': camera.current_fps,
+                'state': camera.state.name,
+                'frame_count': camera.frame_count
+            })
+        
+        return {
+            'node_id': self.node_id,
+            'power_mode': self.metrics.current_power_mode.name,
+            'fps': round(fps, 1),
+            'activity': self.metrics.total_detections,
+            'peers': list(self.mesh.peers.keys()) if self.mesh else [],
+            'cameras': cameras,
+            'timestamp': time.time(),
+            'total_frames': self.metrics.total_frames_processed,
+            'total_detections': self.metrics.total_detections,
+            'total_links': self.metrics.total_links_found,
+            'alerts_count': self.metrics.alerts_count
+        }
+    
+    def get_current_frame_jpeg(self) -> Optional[bytes]:
+        """Get current frame as JPEG bytes"""
+        with self.current_frame_lock:
+            if self.current_frame is None:
+                return None
+            
+            # Encode to JPEG
+            success, buffer = cv2.imencode('.jpg', self.current_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if success:
+                return buffer.tobytes()
+            return None
+    
+    def get_person_event_log(self, limit: int = 100) -> List[Dict]:
+        """Get recent person events"""
+        with self.person_events_lock:
+            events = list(self.person_events)[-limit:]
+            return events
+    
+    def extract_face_embedding(self, image: np.ndarray) -> Optional[np.ndarray]:
+        """Extract face embedding from image"""
+        try:
+            # Use embedding extractor
+            if self.embedding_extractor is None:
+                return None
+            
+            # Detect face region (simplified - use full image)
+            h, w = image.shape[:2]
+            bbox = BoundingBox(0, 0, w, h)
+            
+            # Extract embedding
+            embedding = self.embedding_extractor.extract(image, bbox)
+            return embedding
+        except Exception as e:
+            self.logger.error(f"Error extracting face embedding: {e}")
+            return None
+    
+    def run_face_backtrack(self, embedding: np.ndarray, timestamp: float = None) -> List[Dict]:
+        """Run face backtracking search"""
+        try:
+            results = []
+            
+            # Get frame history
+            if timestamp:
+                # Search around timestamp (±5 minutes)
+                start_time = timestamp - 300
+                end_time = timestamp + 300
+                frames = self.frame_history.get_frame_history(start_time, end_time)
+            else:
+                # Search all frames
+                frames = self.frame_history.get_frame_history()
+            
+            # Search for matching faces
+            for frame, ts in frames:
+                try:
+                    # Extract embedding from frame
+                    frame_embedding = self.extract_face_embedding(frame)
+                    if frame_embedding is None:
+                        continue
+                    
+                    # Compute similarity
+                    similarity = float(np.dot(
+                        embedding / (np.linalg.norm(embedding) + 1e-6),
+                        frame_embedding / (np.linalg.norm(frame_embedding) + 1e-6)
+                    ))
+                    
+                    if similarity > 0.7:  # Threshold
+                        # Encode frame to base64
+                        success, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                        if success:
+                            frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                            
+                            results.append({
+                                'match_timestamp': ts,
+                                'confidence': similarity,
+                                'frame': frame_b64,
+                                'hash_id': None  # TODO: Link to baggage hash_id
+                            })
+                except Exception as e:
+                    self.logger.debug(f"Error processing frame: {e}")
+                    continue
+            
+            # Sort by confidence
+            results.sort(key=lambda x: x['confidence'], reverse=True)
+            return results[:10]  # Top 10 matches
+        
+        except Exception as e:
+            self.logger.error(f"Error in face backtrack: {e}")
+            return []
+    
+    def set_ws_manager(self, ws_manager):
+        """Set WebSocket manager for Command Centre"""
+        self.ws_manager = ws_manager
     
     # ========================================================================
     # LIFECYCLE

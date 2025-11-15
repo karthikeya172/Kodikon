@@ -7,9 +7,23 @@ from typing import List, Optional, Dict, Tuple
 from dataclasses import dataclass
 from queue import Queue
 import argparse
+import sys
+import os
+
+# Add parent directory to path for mesh imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Optional mesh network support
+try:
+    from mesh.udp_setup_guide import IntegratedMeshNode
+    from mesh.event_broadcaster import CameraRole, EventType
+    MESH_AVAILABLE = True
+except ImportError:
+    MESH_AVAILABLE = False
+    logger.warning("Mesh network not available. Install mesh components.")
 
 # Optional YOLO support
 try:
@@ -97,23 +111,45 @@ class WebcamStream:
     def _run_yolo_inference(self, frame):
         """Run YOLO inference on frame"""
         try:
+            if self.yolo_model is None:
+                return
+            
             results = self.yolo_model(frame, conf=self.config.confidence_threshold, verbose=False)
             detections = []
-            for result in results:
-                for box in result.boxes:
-                    detections.append({
-                        "class": result.names[int(box.cls)],
-                        "confidence": float(box.conf),
-                        "bbox": box.xyxy[0].tolist()  # [x1, y1, x2, y2]
-                    })
+            
+            if results and len(results) > 0:
+                result = results[0]
+                if hasattr(result, 'boxes') and result.boxes is not None:
+                    for box in result.boxes:
+                        try:
+                            # Handle tensor/array conversion
+                            class_id = int(box.cls[0]) if hasattr(box.cls, '__len__') else int(box.cls)
+                            class_name = result.names.get(class_id, f"class_{class_id}")
+                            conf = float(box.conf[0]) if hasattr(box.conf, '__len__') else float(box.conf)
+                            bbox = box.xyxy[0].tolist() if len(box.xyxy) > 0 else box.xyxy.tolist()
+                            
+                            detections.append({
+                                "class": class_name,
+                                "confidence": conf,
+                                "bbox": bbox  # [x1, y1, x2, y2]
+                            })
+                        except Exception as box_err:
+                            logger.debug(f"{self.config.name}: Error processing box - {box_err}")
+                            continue
+            
             with self.detection_lock:
                 self.detections = detections
+                
+            if detections:
+                logger.info(f"{self.config.name}: Detected {len(detections)} objects")
+                
         except Exception as e:
-            logger.error(f"{self.config.name}: YOLO inference error - {e}")
+            logger.error(f"{self.config.name}: YOLO inference error - {e}", exc_info=True)
     
     def _inference_loop(self):
         """Background thread for YOLO inference"""
         while self.running:
+            frame_copy = None
             with self.frame_lock:
                 if self.frame is not None and self.frame.size > 0:
                     frame_copy = self.frame.copy()
@@ -213,10 +249,12 @@ class StreamGridDisplay:
         self.max_height = max_height
     
     def _create_grid_layout(self, num_feeds: int) -> Tuple[int, int]:
-        """Calculate optimal grid layout"""
+        """Calculate optimal grid layout (rows, cols)"""
         if num_feeds <= 1:
             return 1, 1
+        # Calculate columns first (square root rounded up)
         cols = int(np.ceil(np.sqrt(num_feeds)))
+        # Calculate rows needed
         rows = int(np.ceil(num_feeds / cols))
         return rows, cols
     
@@ -231,22 +269,23 @@ class StreamGridDisplay:
         if len(frames) == 1:
             return frames[0]
         
-        rows, cols = self._create_grid_layout(len(frames))
+        n = len(frames)
+        rows, cols = self._create_grid_layout(n)
+        h, w = frames[0].shape[:2]
         
         # Pad with black frames if needed
-        pad_count = rows * cols - len(frames)
-        h, w = frames[0].shape[:2]
+        pad_count = rows * cols - n
         for _ in range(pad_count):
             frames.append(np.zeros((h, w, 3), dtype=np.uint8))
         
-        # Create grid
-        row_list = []
+        # Create grid by stacking rows
+        rows_list = []
         for r in range(rows):
             row_frames = frames[r * cols:(r + 1) * cols]
-            row_list.append(np.hstack(row_frames))
-        grid = np.vstack(row_list)
+            rows_list.append(np.hstack(row_frames))
+        grid = np.vstack(rows_list)
         
-        # Resize if necessary
+        # Resize if necessary to fit screen
         grid_h, grid_w = grid.shape[:2]
         if grid_h > self.max_height or grid_w > self.max_width:
             scale = min(self.max_width / grid_w, self.max_height / grid_h)
@@ -261,18 +300,30 @@ class StreamGridDisplay:
 
 
 class PhoneStreamViewer:
-    """Lightweight IP Webcam viewer with multi-feed support and optional YOLO inference"""
+    """Lightweight IP Webcam viewer with multi-feed support, YOLO inference, and mesh networking"""
     
-    def __init__(self, configs: List[StreamConfig], enable_yolo: bool = False):
+    def __init__(self, configs: List[StreamConfig], enable_yolo: bool = False, enable_mesh: bool = True,
+                 mesh_port: int = 9999, mesh_location: str = "streaming_hub"):
         self.configs = configs
         self.streams: List[WebcamStream] = []
         self.display = StreamGridDisplay()
         self.running = True
         self.global_yolo = None
         
+        # Mesh network integration
+        self.mesh_node = None
+        self.enable_mesh = enable_mesh and MESH_AVAILABLE
+        self.mesh_port = mesh_port
+        self.mesh_location = mesh_location
+        self.frame_id = 0
+        
         # Initialize global YOLO if requested
         if enable_yolo and YOLO_AVAILABLE:
             self._initialize_global_yolo()
+        
+        # Initialize mesh node if requested
+        if self.enable_mesh:
+            self._initialize_mesh_node()
         
         for config in configs:
             config.enable_yolo = enable_yolo and (self.global_yolo is not None)
@@ -288,6 +339,40 @@ class PhoneStreamViewer:
         except Exception as e:
             logger.error(f"Global YOLO initialization failed: {e}")
             self.global_yolo = None
+    
+    def _initialize_mesh_node(self):
+        """Initialize mesh network node"""
+        try:
+            logger.info("Initializing mesh network node...")
+            self.mesh_node = IntegratedMeshNode(
+                node_id=f"streaming_{int(time.time() % 10000)}",
+                port=self.mesh_port,
+                location_signature=self.mesh_location,
+                camera_role="surveillance"  # Streaming hub is surveillance point
+            )
+            self.mesh_node.start()
+            logger.info(f"Mesh node started: {self.mesh_node.node_id} on port {self.mesh_port}")
+            
+            # Register event listeners for mesh updates
+            self._setup_mesh_listeners()
+        except Exception as e:
+            logger.error(f"Failed to initialize mesh node: {e}")
+            self.mesh_node = None
+            self.enable_mesh = False
+    
+    def _setup_mesh_listeners(self):
+        """Setup mesh event listeners"""
+        if not self.mesh_node:
+            return
+        
+        def on_mismatch(event):
+            logger.warning(f"MESH ALERT: Mismatch at {event.location_signature} - Person {event.person_ids[0]}")
+        
+        def on_transfer(event):
+            logger.info(f"MESH: Transfer detected - Bag {event.bag_ids[0]}")
+        
+        self.mesh_node.register_event_handler(EventType.MISMATCH_ALERT, on_mismatch)
+        self.mesh_node.register_event_handler(EventType.BAG_TRANSFER, on_transfer)
     
     def _prepare_frame(self, stream: WebcamStream, frame: np.ndarray) -> np.ndarray:
         """Prepare frame with metadata and optional detections"""
@@ -314,8 +399,45 @@ class PhoneStreamViewer:
             det_count = len(stream.get_detections())
             cv2.putText(display_frame, f"Detections: {det_count}", (w - 200, 30),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            
+            # Broadcast detections to mesh network
+            if self.enable_mesh and self.mesh_node:
+                self._broadcast_detections_to_mesh(stream, det_count)
+        
+        # Draw mesh status
+        if self.enable_mesh and self.mesh_node:
+            mesh_status = "MESH OK" if self.mesh_node.running else "MESH OFF"
+            mesh_color = (0, 255, 0) if self.mesh_node.running else (0, 0, 255)
+            cv2.putText(display_frame, mesh_status, (w - 150, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, mesh_color, 1)
         
         return display_frame
+    
+    def _broadcast_detections_to_mesh(self, stream: WebcamStream, detection_count: int):
+        """Broadcast YOLO detections to mesh network"""
+        try:
+            if not self.mesh_node or not stream.get_detections():
+                return
+            
+            detections = stream.get_detections()
+            persons = [d['id'] for d in detections if d.get('class_name') == 'person']
+            bags = [d['id'] for d in detections if d.get('class_name') in ['bag', 'backpack', 'suitcase']]
+            
+            if persons or bags:
+                self.mesh_node.process_vision_frame(
+                    detected_persons=persons,
+                    detected_bags=bags,
+                    person_bag_links={},
+                    frame_metadata={
+                        'frame_id': self.frame_id,
+                        'stream': stream.config.name,
+                        'detection_count': detection_count,
+                        'confidence': stream.config.confidence_threshold
+                    }
+                )
+                self.frame_id += 1
+        except Exception as e:
+            logger.debug(f"Error broadcasting detections: {e}")
     
     def _create_placeholder_frame(self, stream: WebcamStream) -> np.ndarray:
         """Create placeholder for disconnected stream"""
@@ -373,6 +495,15 @@ class PhoneStreamViewer:
         """Graceful shutdown"""
         logger.info("Shutting down PhoneStreamViewer...")
         self.running = False
+        
+        # Shutdown mesh network
+        if self.mesh_node and self.enable_mesh:
+            try:
+                logger.info("Shutting down mesh network...")
+                self.mesh_node.stop()
+            except Exception as e:
+                logger.error(f"Error stopping mesh node: {e}")
+        
         for stream in self.streams:
             stream.stop()
         cv2.destroyAllWindows()
@@ -419,6 +550,16 @@ Controls:
                        help='Max connection retries per stream (default: 3)')
     parser.add_argument('--retry-delay', type=int, default=2,
                        help='Delay between retries in seconds (default: 2)')
+    
+    # Mesh network options
+    parser.add_argument('--mesh', action='store_true', default=True,
+                       help='Enable mesh network broadcasting (default: enabled)')
+    parser.add_argument('--no-mesh', action='store_false', dest='mesh',
+                       help='Disable mesh network broadcasting')
+    parser.add_argument('--mesh-port', type=int, default=9999,
+                       help='UDP port for mesh network (default: 9999)')
+    parser.add_argument('--mesh-location', type=str, default='streaming_hub',
+                       help='Location signature for mesh network (default: streaming_hub)')
     
     return parser.parse_args()
 
@@ -487,7 +628,7 @@ def main():
                 confidence_threshold=args.confidence
             ),
             StreamConfig(
-                url="http://10.197.139.192:8080/video",
+                url="http://10.197.139.108:8080/video",
                 name="Phone 2",
                 max_retries=args.retries,
                 retry_delay=args.retry_delay,
@@ -495,8 +636,8 @@ def main():
                 confidence_threshold=args.confidence
             ),
             StreamConfig(
-                url="http://10.197.139.108:8080/video",
-                name="Phone 2",
+                url="http://10.197.139.192:8080/video",
+                name="Phone 3",
                 max_retries=args.retries,
                 retry_delay=args.retry_delay,
                 enable_yolo=args.yolo,
@@ -508,8 +649,19 @@ def main():
     for config in configs:
         logger.info(f"  - {config.name}: {config.url} (YOLO: {config.enable_yolo})")
     
+    if args.mesh:
+        logger.info(f"Mesh network: ENABLED (port={args.mesh_port}, location={args.mesh_location})")
+    else:
+        logger.info("Mesh network: DISABLED")
+    
     # Create viewer and run
-    viewer = PhoneStreamViewer(configs, enable_yolo=args.yolo)
+    viewer = PhoneStreamViewer(
+        configs, 
+        enable_yolo=args.yolo,
+        enable_mesh=args.mesh,
+        mesh_port=args.mesh_port,
+        mesh_location=args.mesh_location
+    )
     viewer.run()
 
 

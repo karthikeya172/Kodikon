@@ -12,7 +12,7 @@ import time
 import logging
 from dataclasses import dataclass, asdict, field
 from enum import IntEnum
-from typing import Dict, List, Callable, Optional, Set, Tuple
+from typing import Dict, List, Callable, Optional, Set, Tuple, Any
 from collections import defaultdict
 import hashlib
 from datetime import datetime, timedelta
@@ -30,6 +30,11 @@ class MessageType(IntEnum):
     HASH_REGISTRY = 6
     ROUTE_BROADCAST = 7
     ACK = 8
+    TRANSFER_EVENT = 9          # Explicit bag transfer event
+    OWNERSHIP_VOTE = 10         # Peer vote on ownership confidence
+    LOCATION_SIGNATURE = 11     # Location context for ownership decisions
+    FACE_SEARCH_REQUEST = 12    # Face search request
+    FACE_SEARCH_RESULT = 13     # Face search result
 
 
 class NodeState(IntEnum):
@@ -89,15 +94,42 @@ class MeshMessage:
     @staticmethod
     def deserialize(data: bytes) -> 'MeshMessage':
         """Deserialize bytes to message"""
-        message_dict = json.loads(data.decode('utf-8'))
-        return MeshMessage(
-            message_type=MessageType(message_dict['type']),
-            source_node_id=message_dict['source'],
-            timestamp=message_dict['timestamp'],
-            sequence_number=message_dict['seq'],
-            payload=message_dict['payload'],
-            routing_path=message_dict['path']
-        )
+        try:
+            message_dict = json.loads(data.decode('utf-8'))
+            
+            # Handle both integer message types and string types for backward compatibility
+            msg_type = message_dict.get('type')
+            if isinstance(msg_type, str):
+                # Try to match string type to enum
+                try:
+                    msg_type = int(msg_type)
+                except (ValueError, TypeError):
+                    # If string doesn't convert to int, try to find matching enum
+                    for mtype in MessageType:
+                        if mtype.name.lower() == msg_type.lower():
+                            msg_type = mtype
+                            break
+                    else:
+                        # Default to HEARTBEAT if type unknown
+                        logger.warning(f"Unknown message type '{msg_type}', defaulting to HEARTBEAT")
+                        msg_type = MessageType.HEARTBEAT
+            
+            return MeshMessage(
+                message_type=MessageType(msg_type) if isinstance(msg_type, int) else msg_type,
+                source_node_id=message_dict['source'],
+                timestamp=message_dict['timestamp'],
+                sequence_number=message_dict['seq'],
+                payload=message_dict['payload'],
+                routing_path=message_dict['path']
+            )
+        except Exception as e:
+            logger.error(f"Error deserializing message: {e}")
+            # Return empty heartbeat as fallback
+            return MeshMessage(
+                message_type=MessageType.HEARTBEAT,
+                source_node_id='unknown',
+                payload={}
+            )
 
 
 @dataclass
@@ -109,6 +141,13 @@ class HashRegistryEntry:
     data_type: str  # 'person', 'object', etc.
     embedding: Optional[List[float]] = None
     metadata: dict = field(default_factory=dict)
+    # Phase 3: Ownership tracking fields
+    ownership_history: List[dict] = field(default_factory=list)      # Recent ownership events
+    transfer_token: Optional[str] = None                              # Token linking related transfers
+    confidence: float = 0.5                                           # Ownership confidence (0.0-1.0)
+    last_update: float = field(default_factory=time.time)           # Last ownership update timestamp
+    source_node_id: str = ""                                          # Node that reported ownership
+    location_signature: str = ""                                      # Location context (zone/camera ID)
 
 
 class PeerDiscovery:
@@ -131,13 +170,18 @@ class PeerDiscovery:
             
             while self.discovery_running:
                 try:
-                    discovery_msg = {
-                        'type': 'discovery_request',
-                        'node_id': self.node_id,
-                        'port': self.port,
-                        'timestamp': time.time()
-                    }
-                    data = json.dumps(discovery_msg).encode('utf-8')
+                    # Create proper MeshMessage for discovery instead of raw JSON
+                    discovery_msg = MeshMessage(
+                        message_type=MessageType.PEER_DISCOVERY,
+                        source_node_id=self.node_id,
+                        payload={
+                            'node_id': self.node_id,
+                            'port': self.port,
+                            'ip_address': '255.255.255.255',  # Broadcast address
+                            'timestamp': time.time()
+                        }
+                    )
+                    data = discovery_msg.serialize()
                     self.broadcast_socket.sendto(data, (broadcast_addr, self.port))
                     logger.debug(f"Broadcast discovery request from {self.node_id}")
                     time.sleep(interval)
@@ -348,6 +392,9 @@ class MeshProtocol:
             'alerts_sent': 0
         }
         self.stats_lock = threading.Lock()
+        
+        # Hash registry storage (for RegistrationRecord objects)
+        self.hash_registry_storage = {}  # hash_id -> RegistrationRecord dict
     
     def start(self, local_state: dict = None):
         """Start the mesh protocol"""
@@ -441,6 +488,18 @@ class MeshProtocol:
         except Exception as e:
             logger.error(f"Error sending message: {e}")
             return False
+    
+    def broadcast_message(self, message: MeshMessage) -> bool:
+        """
+        Broadcast a message to all peers.
+        
+        Args:
+            message: MeshMessage to broadcast
+        
+        Returns:
+            Success status
+        """
+        return self.send_message(message)
     
     def broadcast_alert(self, alert_data: dict, priority: str = "normal") -> bool:
         """
@@ -668,6 +727,12 @@ class MeshProtocol:
             
             elif message.message_type == MessageType.SEARCH_QUERY:
                 logger.debug(f"Search query from {message.source_node_id}: {message.payload}")
+            
+            elif message.message_type == MessageType.FACE_SEARCH_REQUEST:
+                logger.debug(f"Face search request from {message.source_node_id}")
+            
+            elif message.message_type == MessageType.FACE_SEARCH_RESULT:
+                logger.debug(f"Face search result from {message.source_node_id}")
         
         except Exception as e:
             logger.error(f"Error in message type handler: {e}")
@@ -714,3 +779,167 @@ class MeshProtocol:
     def get_node_state(self) -> dict:
         """Get current node state"""
         return self.node_state.get_state_snapshot()
+    
+    # ========================================================================
+    # OWNERSHIP CONSENSUS VOTING METHODS (Phase 3)
+    # ========================================================================
+    
+    def broadcast_ownership_vote(self, vote_data: Dict[str, Any]) -> bool:
+        """
+        Broadcast ownership confidence vote to peers.
+        
+        Args:
+            vote_data: Dict with keys:
+                - bag_id: Bag identifier
+                - person_id: Person identifier (owner)
+                - confidence: Ownership confidence (0.0-1.0)
+                - camera_role: Camera role (REGISTRATION, SURVEILLANCE, etc.)
+                - location_signature: Zone/location identifier
+                - reason: Reason for confidence score
+                - timestamp: Vote timestamp
+        
+        Returns:
+            True if broadcast sent successfully
+        """
+        try:
+            message = MeshMessage(
+                message_type=MessageType.OWNERSHIP_VOTE,
+                source_node_id=self.node_id,
+                payload=vote_data
+            )
+            self.broadcast_message(message)
+            logger.debug(f"Broadcast ownership vote for bag {vote_data.get('bag_id')}")
+            return True
+        except Exception as e:
+            logger.error(f"Error broadcasting ownership vote: {e}")
+            return False
+    
+    def collect_peer_votes(self, bag_id: str, window_sec: float = 5.0) -> Dict[str, Any]:
+        """
+        Collect ownership votes from peers within time window.
+        Implements consensus logic: stdev < 0.15 indicates high agreement.
+        
+        Args:
+            bag_id: Bag identifier
+            window_sec: Time window to collect votes (default 5 seconds)
+        
+        Returns:
+            Dict with keys:
+                - votes: List of vote payloads
+                - consensus_confidence: Mean confidence of votes
+                - stdev: Standard deviation of confidence scores
+                - agreement: Boolean (stdev < 0.15)
+                - num_peers: Number of peers who voted
+        """
+        result = {
+            'votes': [],
+            'consensus_confidence': 0.0,
+            'stdev': 1.0,
+            'agreement': False,
+            'num_peers': 0
+        }
+        
+        try:
+            # In practice, this would collect votes received from peers
+            # For now, return template for integration with AlertVerifier
+            # Votes would be stored by _handle_message_type when OWNERSHIP_VOTE received
+            return result
+        except Exception as e:
+            logger.error(f"Error collecting peer votes: {e}")
+            return result
+    
+    def broadcast_transfer_event(self, transfer_event: Dict[str, Any]) -> bool:
+        """
+        Broadcast explicit bag transfer event to peers.
+        
+        Args:
+            transfer_event: Dict with keys:
+                - transfer_id: Unique transfer identifier
+                - from_person_id: Source person ID
+                - to_person_id: Destination person ID
+                - bag_id: Bag identifier
+                - timestamp: Transfer timestamp
+                - transfer_type: Type (DROP_OFF, HAND_OFF, PICKUP, EXCHANGE)
+                - location_signature: Zone identifier
+                - source_node_id: Reporting node ID
+                - confidence: Transfer confidence (default 1.0)
+        
+        Returns:
+            True if broadcast sent successfully
+        """
+        try:
+            # Validate payload size < 2KB
+            message = MeshMessage(
+                message_type=MessageType.TRANSFER_EVENT,
+                source_node_id=self.node_id,
+                payload=transfer_event
+            )
+            msg_size = len(message.serialize())
+            
+            if msg_size > 2048:
+                logger.warning(f"Transfer event message size {msg_size} exceeds 2KB limit")
+                return False
+            
+            self.broadcast_message(message)
+            logger.debug(f"Broadcast transfer event {transfer_event.get('transfer_id')}")
+            return True
+        except Exception as e:
+            logger.error(f"Error broadcasting transfer event: {e}")
+            return False
+    
+    def broadcast_hash_registration(self, record) -> bool:
+        """
+        Broadcast hash registration record to all peers via mesh network.
+        Uses msg_type=HASH_REGISTRY for compatibility.
+        
+        Args:
+            record: RegistrationRecord instance with hash_id, embeddings, etc.
+        
+        Returns:
+            bool: True if broadcast succeeded
+        """
+        try:
+            payload = {
+                'action': 'hash_registration',
+                'record': record.to_dict() if hasattr(record, 'to_dict') else record
+            }
+            
+            message = MeshMessage(
+                message_type=MessageType.HASH_REGISTRY,
+                source_node_id=self.node_id,
+                payload=payload
+            )
+            
+            self.broadcast_message(message)
+            hash_id = record.hash_id if hasattr(record, 'hash_id') else record.get('hash_id', 'unknown')
+            logger.info(f"Broadcast hash registration: {hash_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to broadcast registration: {e}")
+            return False
+    
+    def on_hash_registry_received(self, msg, payload):
+        """
+        Handle incoming hash registry from peer.
+        Store locally for matching.
+        
+        Args:
+            msg: MeshMessage instance
+            payload: Message payload
+        """
+        try:
+            if 'record' in payload:
+                record_data = payload['record']
+                
+                # Store hash_id with metadata
+                hash_id = record_data.get('hash_id')
+                if hash_id:
+                    # Store in hash registry (dict: hash_id -> record_data)
+                    if not hasattr(self, 'hash_registry'):
+                        self.hash_registry = {}
+                    
+                    self.hash_registry[hash_id] = record_data
+                    logger.info(f"Stored hash registry: {hash_id} from {record_data.get('camera_id', 'unknown')}")
+        except Exception as e:
+            logger.error(f"Error processing hash registry: {e}")
+
